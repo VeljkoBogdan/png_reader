@@ -4,7 +4,9 @@
 #include <vector>
 #include <cstdio>
 #include <cstddef>
+#include <format>
 #include <string>
+#include <zlib.h>
 
 uint32_t swap32(uint32_t val) {
 #if defined(__GNUC__) || defined(__clang__)
@@ -24,21 +26,38 @@ inline std::string resourcePath(const std::string& relative) {
 struct Chunk {
     uint32_t length;
     uint32_t chunk_type;
-    std::vector<std::byte> image_data;
+    std::vector<uint8_t> image_data;
     uint32_t crc;
 };
 
 struct Image {
-    int32_t width = 0, height = 0;
-    std::byte bit_depth{0x0}, color_type{0x0}, compression_method{0x0}, filter_method{0x0}, interlace_method{0x0};
+    // 0 is an invalid value for w and h
+    int32_t width = 0;
+    int32_t height = 0;
+    std::byte bit_depth{0x0}; // 1, 2, 4, 8, 16 - not all are allowed for any color type
+    std::byte color_type{0x0}; // 0, 2, 3, 4, 6
+    std::byte compression_method{0x0}; // only compression method 0 is defined
+    std::byte filter_method{0x0}; // only filter method 0 is defined
+    std::byte interlace_method{0x0}; // only interlace method 0 and 1 are defined
     std::vector<Chunk> chunks;
+    bool has_plte = false;
 };
+
+/* color type || allowed bit depths
+        0     |    1, 2, 4, 8, 16  - each pixel is a grayscale sample
+        2     |    8, 16           - each pixel is an RGB triple
+        3     |    1, 2, 4, 8      - each pixel is a pallete index, PLTE chunk must appear
+        4     |    8, 16           - each pixel is a grayscale sample, followed by an alpha sample
+        6     |    8, 16           - each pixel is an RGB triple, followed by an alpha sample
+*/
+// Sample depth is always the same as bit depth, instead of case 3 where it is 8 bits
 
 // png file structure
 // length | chunk type | chunk data | CRC
 // 4B uint| 4B         | length in B| 4B
 
 // constants
+constexpr uint32_t ihdr_length = 13u;
 constexpr uint32_t IEND = 0x49454E44;
 constexpr uint32_t IHDR = 0x49484452;
 constexpr uint32_t IDAT = 0x49444154;
@@ -83,113 +102,192 @@ unsigned long crc(unsigned char *buf, int len) {
     return update_crc(0xffffffffL, buf, len) ^ 0xffffffffL;
 }
 
+constexpr uint32_t d(const int val) { return (1u << val); }
+constexpr uint32_t color_type_infos[7] = {
+    { d(1)|d(2)|d(4)|d(8)|d(16) }, // 0
+    { 0 }, // 1 not possible
+    { d(8)|d(16) }, // 2
+    { d(1)|d(2)|d(4)|d(8) }, // 3
+    { d(8)|d(16) }, // 4
+    { 0 }, // 5 not possible
+    { d(8)|d(16) } // 6
+};
+
+void verify_ihdr(const Image& image) {
+    auto& first_chunk = image.chunks.front();
+    if (first_chunk.chunk_type != IHDR) throw std::runtime_error("Corrupted file. IHDR chunk expected to be first.\n");
+    if (first_chunk.length != 13) throw std::runtime_error("Corrupted file. IHDR chunk expected to have a length of 13.\n");
+    if (image.width <= 0 || image.height <= 0) throw std::runtime_error("Corrupted file. Width and height should not be 0 or negative.\n");
+    // check color types
+    if (std::to_integer<uint8_t>(image.color_type) > 6) throw std::runtime_error("Corrupted file. Color type must be 6 or below");
+    for (uint32_t i = 0; i <= 6; i++) {
+        if (std::to_integer<uint32_t>(image.color_type) != i) continue;
+        if (std::to_integer<uint32_t>(image.bit_depth) & color_type_infos[i])
+            throw std::runtime_error(std::format("Corrupted file. Color type and bit depth do not match for color type: {}\n",
+                std::to_integer<uint32_t>(image.color_type)));
+        break;
+    }
+    if (std::to_integer<uint8_t>(image.compression_method) != 0u) throw std::runtime_error("Corrupted file. Compression method is expected to be 0.");
+    if (std::to_integer<uint8_t>(image.filter_method) != 0u) throw std::runtime_error("Corrupted file. Filter method is expected to be 0.");
+    if (!(std::to_integer<uint8_t>(image.filter_method) == 0u || std::to_integer<uint8_t>(image.filter_method) == 1u))
+        throw std::runtime_error("Corrupted file. Filter method is expected to be 0.");
+}
+
+void verify_iend(const Image& image) {
+    auto& last_chunk = image.chunks.back();
+    if (last_chunk.chunk_type != IEND) throw std::runtime_error("Corrupted file. IEND chunk expected to be last.\n");
+    if (last_chunk.length != 0) throw std::runtime_error("Corrupted file. IEND length should be 0.\n");
+    if (!last_chunk.image_data.empty()) throw std::runtime_error("Corrupted file. IEND image data should be empty.\n");
+}
+
+const Chunk& find_plte(const Image& image) {
+    for (auto& chunk : image.chunks) if (chunk.chunk_type == PLTE) return chunk;
+}
+
+bool has_multiple_plte(const Image& image) {
+    int count = 0;
+    for (auto& chunk : image.chunks) if (chunk.chunk_type == PLTE) count ++;
+    return count > 1;
+}
+void verify_plte(const Image& image) {
+    // there must be only 1 plte chunk
+    if (has_multiple_plte(image)) throw std::runtime_error("Corrupted file. PLTE chunk can be present only once.\n");
+    // has to be with type 3, cannot be with type 0 and 4
+    const int c_type = std::to_integer<int>(image.color_type);
+    if (!image.has_plte && c_type == 3) throw std::runtime_error("Corrupted file. PLTE chunk has to be present with color type 3!\n");
+    if (image.has_plte && (c_type == 0 || c_type == 4)) throw std::runtime_error(std::format("Corrupted file. PLTE chunk cannot be present with color type: {}!\n", c_type));
+    // if there is no plte, we can return
+    if (!image.has_plte) return;
+    auto& plte_chunk = find_plte(image);
+    if (plte_chunk.length % 3 != 0) throw std::runtime_error("Corrupted file. PLTE chunk length is expected to be divisible by 3");
+}
+
+bool decompress_dynamic(const std::vector<uint8_t>& compressed_data, std::vector<uint8_t>& out_decompressed_data) {
+    z_stream stream;
+
+    stream.zalloc = Z_NULL;
+    stream.zfree = Z_NULL;
+    stream.opaque = Z_NULL;
+    stream.avail_in = 0;
+    stream.next_in = Z_NULL;
+
+    if (int err = inflateInit2(&stream, -MAX_WBITS) != Z_OK) {
+        std::printf("Error during decompression: %d", err);
+        return false;
+    }
+
+    stream.avail_in = compressed_data.size();
+    stream.next_in = const_cast<Bytef*>(compressed_data.data());
+
+    std::vector<uint8_t> out_buf;
+    const size_t chunk_size = 32768; // 32KB
+    std::vector<uint8_t> temp_buf(chunk_size);
+
+    int status = Z_OK;
+    while (status == Z_OK) {
+        stream.next_out = temp_buf.data();
+        stream.avail_out = chunk_size;
+
+        status = inflate(&stream, Z_NO_FLUSH);
+
+        if (status == Z_OK || status == Z_STREAM_END) {
+            size_t b_decompressed = chunk_size - stream.avail_in;
+            out_buf.insert(out_buf.end(), temp_buf.begin(), temp_buf.begin() + b_decompressed);
+        }
+
+        if (status == Z_STREAM_END) break;
+        if (status != Z_OK) {
+            inflateEnd(&stream);
+            std::printf("Decompression failed with error: %s", std::to_string(status).c_str());
+            return false;
+        }
+    }
+
+    inflateEnd(&stream);
+    out_decompressed_data = std::move(out_buf);
+
+    return true;
+}
+
 // ReSharper disable once CppDFAConstantConditions
 int main() {
     Image image;
-    const char* sample_loc = resourcePath("sample.png").c_str();
+    std::string sample_loc = resourcePath("sample2.png");
     std::ifstream file(sample_loc, std::ios::binary | std::ios::ate);
-    if (!file) {
-        std::cerr << "Error opening file for reading.\n";
-        return 1;
-    }
+    if (!file) throw std::runtime_error("File could not be loaded!\n");
 
     // filesize
     std::streamsize file_size = file.tellg();
-    if (file_size <= 0) {
-        std::cerr << "File is empty.\n";
-        return 1;
-    }
+    if (file_size <= 0) throw std::runtime_error("File size is 0 or less!\n");
 
     // verifying file signature
     file.seekg(0, std::ios::beg);
     std::vector<uint8_t> buffer(png_file_sign.size());
-    if (!file.read(reinterpret_cast<char*>(buffer.data()), png_file_sign.size())) {
-        std::cerr << "Cannot read file!\n";
-        return 1;
-    }
-    if (buffer != png_file_sign) {
-        std::cerr << "File is not a valid .png!\n";
-        return 1;
-    }
+    if (!file.read(reinterpret_cast<char*>(buffer.data()), png_file_sign.size())) throw std::runtime_error("Couldn't read file!\n");
+    if (buffer != png_file_sign) throw std::runtime_error("File is not a valid png!\n");
 
     // image chunks
     std::vector<Chunk> image_chunks;
     bool shouldExit = false;
+    int chunk_count = 0;
     do {
         // get length of chunk
         uint32_t length{0u};
-        if (!file.read(reinterpret_cast<char*>(&length), 4)) {
-            std::cerr << "Error reading chunk length.\n";
-            return 1;
-        }
+        if (!file.read(reinterpret_cast<char*>(&length), 4)) throw std::runtime_error("Error reading file length,\n");
         length = swap32(length);
-        if (length > 0x7FFFFFFF) {
-            std::cerr << "File is corrupted! Unrealistic or negative chunk length.\n";
-            return 1;
-        }
+        if (length > 0x7FFFFFFF) throw std::runtime_error("File is corrupted. Unrealistic or negative chunk length.\n");
         // get chunk type
         uint32_t chunk_type{0u};
-        if (!file.read(reinterpret_cast<char*>(&chunk_type), 4)) {
-            std::cerr << "Error reading chunk type.\n";
-            return 1;
-        }
+        if (!file.read(reinterpret_cast<char*>(&chunk_type), 4)) throw std::runtime_error("Error reading chunk type.\n");
         chunk_type = swap32(chunk_type);
         if (chunk_type == IEND) shouldExit = true;
         if (chunk_type == IHDR) {
-            if (!file.read(reinterpret_cast<char*>(&image.width), 4)) {
-                std::cerr << "Error parsing IHDR chunk";
-                return 1;
-            }
-            if (!file.read(reinterpret_cast<char*>(&image.height), 4)) {
-                std::cerr << "Error parsing IHDR chunk";
-                return 1;
-            }
-            if (!file.read(reinterpret_cast<char*>(&image.bit_depth), 1)) {
-                std::cerr << "Error parsing IHDR chunk";
-                return 1;
-            }
-            if (!file.read(reinterpret_cast<char*>(&image.color_type), 1)) {
-                std::cerr << "Error parsing IHDR chunk";
-                return 1;
-            }
-            if (!file.read(reinterpret_cast<char*>(&image.compression_method), 1)) {
-                std::cerr << "Error parsing IHDR chunk";
-                return 1;
-            }
-            if (!file.read(reinterpret_cast<char*>(&image.filter_method), 1)) {
-                std::cerr << "Error parsing IHDR chunk";
-                return 1;
-            }
-            if (!file.read(reinterpret_cast<char*>(&image.interlace_method), 1)) {
-                std::cerr << "Error parsing IHDR chunk";
-                return 1;
-            }
+            if (!file.read(reinterpret_cast<char*>(&image.width), 4)) throw std::runtime_error("Error parsing IHDR chunk.\n");
+            if (!file.read(reinterpret_cast<char*>(&image.height), 4)) throw std::runtime_error("Error parsing IHDR chunk.\n");
+            if (!file.read(reinterpret_cast<char*>(&image.bit_depth), 1)) throw std::runtime_error("Error parsing IHDR chunk.\n");
+            if (!file.read(reinterpret_cast<char*>(&image.color_type), 1)) throw std::runtime_error("Error parsing IHDR chunk.\n");
+            if (!file.read(reinterpret_cast<char*>(&image.compression_method), 1)) throw std::runtime_error("Error parsing IHDR chunk.\n");
+            if (!file.read(reinterpret_cast<char*>(&image.filter_method), 1)) throw std::runtime_error("Error parsing IHDR chunk.\n");
+            if (!file.read(reinterpret_cast<char*>(&image.interlace_method), 1)) throw std::runtime_error("Error parsing IHDR chunk.\n");
             file.seekg(-13, std::ios::cur);
         }
+        if (chunk_type == PLTE) image.has_plte = true;
         // read chunk data using length
-        std::vector<std::byte> image_data(length);
-        if (length > 0u) {
-            if (!file.read(reinterpret_cast<char*>(image_data.data()), length)) {
-                std::cerr << "Error reading chunk image data.\n";
-                return 1;
-            }
-        }
+        std::vector<uint8_t> image_data(length);
+        if (length > 0u) if (!file.read(reinterpret_cast<char*>(image_data.data()), length)) throw std::runtime_error("Error reading image data.\n");
         // read crc
         uint32_t crc{0u};
-        if (!file.read(reinterpret_cast<char*>(&crc), 4)) {
-            std::cerr << "Error reading CRC.\n";
-            return 1;
-        }
+        if (!file.read(reinterpret_cast<char*>(&crc), 4)) throw std::runtime_error("Error reading chunk CRC.\n");
         crc = swap32(crc);
 
         image_chunks.emplace_back(Chunk{length, chunk_type, std::move(image_data), crc});
+        chunk_count++;
     } while (!shouldExit);
 
     image.width = swap32(image.width);
     image.height = swap32(image.height);
     image.chunks = std::move(image_chunks);
 
+    // verify
+    verify_ihdr(image);
+    verify_iend(image);
+    verify_plte(image);
+
+    // decompression
+    std::vector<std::vector<uint8_t>> image_chunk_data;
+    for (int i = 0; i < image.chunks.size(); i++) {
+        if (image.chunks[0].chunk_type != IDAT) continue;
+        if (!decompress_dynamic(image.chunks[i].image_data, image_chunk_data[i])) {
+            throw std::runtime_error("Decompression failed!");
+        }
+    }
+
     std::printf("Width: %d, Height: %d\n", image.width, image.height);
+    std::printf("Bit depth: %d\n", image.bit_depth);
+    std::printf("Color Type: %d\n", image.color_type);
+    std::printf("Compression Method: %d\n", image.compression_method);
+    std::printf("Filter Method: %d\n", image.filter_method);
+    std::printf("Interlace Method: %d\n", image.interlace_method);
     for (auto&[length, chunk_type, image_data, crc] : image.chunks) {
         std::printf("[");
         std::printf("%u, ", length);

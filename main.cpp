@@ -7,6 +7,9 @@
 #include <format>
 #include <string>
 #include <zlib.h>
+#include <cmath>
+
+#include "raylib.h"
 
 uint32_t swap32(uint32_t val) {
 #if defined(__GNUC__) || defined(__clang__)
@@ -30,7 +33,7 @@ struct Chunk {
     uint32_t crc;
 };
 
-struct Image {
+struct ImagePNG {
     // 0 is an invalid value for w and h
     int32_t width = 0;
     int32_t height = 0;
@@ -113,7 +116,7 @@ constexpr uint32_t color_type_infos[7] = {
     { d(8)|d(16) } // 6
 };
 
-void verify_ihdr(const Image& image) {
+void verify_ihdr(const ImagePNG& image) {
     auto& first_chunk = image.chunks.front();
     if (first_chunk.chunk_type != IHDR) throw std::runtime_error("Corrupted file. IHDR chunk expected to be first.\n");
     if (first_chunk.length != 13) throw std::runtime_error("Corrupted file. IHDR chunk expected to have a length of 13.\n");
@@ -133,23 +136,23 @@ void verify_ihdr(const Image& image) {
         throw std::runtime_error("Corrupted file. Filter method is expected to be 0.");
 }
 
-void verify_iend(const Image& image) {
+void verify_iend(const ImagePNG& image) {
     auto& last_chunk = image.chunks.back();
     if (last_chunk.chunk_type != IEND) throw std::runtime_error("Corrupted file. IEND chunk expected to be last.\n");
     if (last_chunk.length != 0) throw std::runtime_error("Corrupted file. IEND length should be 0.\n");
     if (!last_chunk.image_data.empty()) throw std::runtime_error("Corrupted file. IEND image data should be empty.\n");
 }
 
-const Chunk& find_plte(const Image& image) {
+const Chunk& find_plte(const ImagePNG& image) {
     for (auto& chunk : image.chunks) if (chunk.chunk_type == PLTE) return chunk;
 }
 
-bool has_multiple_plte(const Image& image) {
+bool has_multiple_plte(const ImagePNG& image) {
     int count = 0;
     for (auto& chunk : image.chunks) if (chunk.chunk_type == PLTE) count ++;
     return count > 1;
 }
-void verify_plte(const Image& image) {
+void verify_plte(const ImagePNG& image) {
     // there must be only 1 plte chunk
     if (has_multiple_plte(image)) throw std::runtime_error("Corrupted file. PLTE chunk can be present only once.\n");
     // has to be with type 3, cannot be with type 0 and 4
@@ -171,10 +174,12 @@ bool decompress_dynamic(const std::vector<uint8_t>& compressed_data, std::vector
     stream.avail_in = 0;
     stream.next_in = Z_NULL;
 
-    if (int err = inflateInit2(&stream, -MAX_WBITS) != Z_OK) {
+    int err = inflateInit2(&stream, MAX_WBITS);
+    if (err != Z_OK) {
         std::printf("Error during decompression: %d", err);
         return false;
     }
+    std::printf("Initialized inflate stream\n");
 
     stream.avail_in = compressed_data.size();
     stream.next_in = const_cast<Bytef*>(compressed_data.data());
@@ -191,7 +196,7 @@ bool decompress_dynamic(const std::vector<uint8_t>& compressed_data, std::vector
         status = inflate(&stream, Z_NO_FLUSH);
 
         if (status == Z_OK || status == Z_STREAM_END) {
-            size_t b_decompressed = chunk_size - stream.avail_in;
+            size_t b_decompressed =  temp_buf.size() - stream.avail_out;
             out_buf.insert(out_buf.end(), temp_buf.begin(), temp_buf.begin() + b_decompressed);
         }
 
@@ -202,17 +207,95 @@ bool decompress_dynamic(const std::vector<uint8_t>& compressed_data, std::vector
             return false;
         }
     }
+    std::printf("Inflate written\n");
 
     inflateEnd(&stream);
+    std::printf("Inflate ended\n");
     out_decompressed_data = std::move(out_buf);
+    std::printf("Decompressed data written\n");
 
     return true;
 }
 
+static int format_for(int color_type) {
+    switch (color_type) {
+        case 0: return PIXELFORMAT_UNCOMPRESSED_GRAYSCALE;
+        case 2: return PIXELFORMAT_UNCOMPRESSED_R8G8B8;
+        case 4: return PIXELFORMAT_UNCOMPRESSED_GRAY_ALPHA;
+        case 6: return PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+        default: throw std::runtime_error(std::format("No format for color type of: {}", color_type));
+    }
+}
+
+static int channels_for(int color_type) {
+    switch (color_type) {
+        case 0: return 1; // grayscale
+        case 2: return 3; // RGB
+        case 3: return 1; // palette index
+        case 4: return 2; // grayscale + alpha
+        case 6: return 4; // RGBA
+        default: throw std::runtime_error("Invalid color type.\n");
+    }
+}
+
+static uint8_t paeth(int a, int b, int c) {
+    const int p  = a + b - c;
+    const int pa = std::abs(p - a);
+    const int pb = std::abs(p - b);
+    const int pc = std::abs(p - c);
+    if (pa <= pb && pa <= pc) return static_cast<uint8_t>(a);
+    if (pb <= pc) return static_cast<uint8_t>(b);
+    return static_cast<uint8_t>(c);
+}
+
+void unfilter(const std::vector<uint8_t>& uncompressed_data, const ImagePNG& image_info, std::vector<uint8_t>& out_unfiltered_data) {
+    if (std::to_integer<uint8_t>(image_info.interlace_method) != 0) throw std::runtime_error("Interlace methods other than 0 are not supported.\n");
+
+    const size_t width = static_cast<size_t>(image_info.width);
+    const size_t height = static_cast<size_t>(image_info.height);
+    const int bit_depth = std::to_integer<uint8_t>(image_info.bit_depth);
+    const int channels = channels_for(std::to_integer<uint8_t>(image_info.color_type));
+
+    const size_t bits_per_pixel = static_cast<size_t>(channels) * bit_depth;
+    const size_t bpp = std::max<size_t>(1, bits_per_pixel / 8);
+    const size_t row_bytes = (width * bits_per_pixel + 7) / 8;
+    const size_t stride = row_bytes + 1;
+
+    if (uncompressed_data.size() != height * stride) throw std::runtime_error("Decompressed size does not match image dimensions.\n");
+
+    out_unfiltered_data.assign(height * row_bytes, 0);
+
+    for (size_t y = 0; y < height; y++) {
+        const uint8_t filter = uncompressed_data[y * stride];
+        const uint8_t* src = &uncompressed_data[y * stride + 1];
+        uint8_t* cur = &out_unfiltered_data[y * row_bytes];
+        const uint8_t* prev = (y > 0) ? &out_unfiltered_data[(y - 1) * row_bytes] : nullptr;
+
+        for (size_t x = 0; x < row_bytes; x++) {
+            const int a = (x >= bpp) ? cur[x - bpp] : 0;
+            const int b = prev ? prev[x] : 0;
+            const int c = (prev && x >= bpp) ? prev[x - bpp] : 0;
+
+            switch (filter) {
+                case 0: cur[x] = src[x]; break;
+                case 1: cur[x] = static_cast<uint8_t>(src[x] + a); break;
+                case 2: cur[x] = static_cast<uint8_t>(src[x] + b); break;
+                case 3: cur[x] = static_cast<uint8_t>(src[x] + ((a + b) / 2)); break;
+                case 4: cur[x] = static_cast<uint8_t>(src[x] + paeth(a, b, c)); break;
+                default: throw std::runtime_error("Invalid filter type in scanline.\n");
+            }
+        }
+    }
+}
+
+void draw_png(const std::vector<uint8_t>& unfiltered_data, const ImagePNG& image_info) {
+
+}
+
 // ReSharper disable once CppDFAConstantConditions
 int main() {
-    Image image;
-    std::string sample_loc = resourcePath("sample2.png");
+    ImagePNG image;
+    std::string sample_loc = resourcePath("sample3.png");
     std::ifstream file(sample_loc, std::ios::binary | std::ios::ate);
     if (!file) throw std::runtime_error("File could not be loaded!\n");
 
@@ -274,13 +357,17 @@ int main() {
     verify_plte(image);
 
     // decompression
-    std::vector<std::vector<uint8_t>> image_chunk_data;
+    std::vector<uint8_t> compressed_image_data;
+    std::vector<uint8_t> uncompressed_image_data;
+    std::vector<uint8_t> unfiltered_image_data;
     for (int i = 0; i < image.chunks.size(); i++) {
-        if (image.chunks[0].chunk_type != IDAT) continue;
-        if (!decompress_dynamic(image.chunks[i].image_data, image_chunk_data[i])) {
-            throw std::runtime_error("Decompression failed!");
-        }
+        if (image.chunks[i].chunk_type != IDAT) continue;
+        compressed_image_data.insert(compressed_image_data.end(), image.chunks[i].image_data.begin(), image.chunks[i].image_data.end());
     }
+    if (!decompress_dynamic(compressed_image_data, uncompressed_image_data)) throw std::runtime_error("Error during decompression!");
+    compressed_image_data.clear();
+    unfilter(uncompressed_image_data, image, unfiltered_image_data);
+    uncompressed_image_data.clear();
 
     std::printf("Width: %d, Height: %d\n", image.width, image.height);
     std::printf("Bit depth: %d\n", image.bit_depth);
@@ -296,6 +383,22 @@ int main() {
         std::printf("%u", crc);
         std::printf("]\n");
     }
+
+    // rendering
+    InitWindow(1280, 720, "PNG Parser");
+
+    auto texture_image = Image(unfiltered_image_data.data(), image.width, image.height, 1, format_for(std::to_integer<int>(image.color_type)));
+    Texture2D texture = LoadTextureFromImage(texture_image);
+
+    while (!WindowShouldClose()) {
+        BeginDrawing();
+            ClearBackground(WHITE);
+            DrawTextureEx(texture, {2, 2}, 0.0f, 1.0f, {255, 255, 255, 255});
+        EndDrawing();
+    }
+
+    UnloadTexture(texture);
+    CloseWindow();
 
     return 0;
 }
